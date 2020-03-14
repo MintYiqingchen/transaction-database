@@ -1,0 +1,78 @@
+from xmlrpc.client import ServerProxy
+import os
+import sys
+import argparse
+import time
+import timeit
+import re
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--host', default="http://127.0.0.1:25000")
+args = parser.parse_args()
+
+INSERT_FILE = './data/low_concurrency/observation_low_concurrency.sql'
+TIME_INT = 5 * 60 # 5 min
+def parseInsertFile(fname, group_size = 1):
+    with open(fname) as f:
+        states = [line.strip() for line in f if not line.startswith('--')]
+    set_state = []
+    insert_state = []
+    for l in states:
+        if l.startswith('SET'):
+            set_state.append(l)
+        elif len(l) > 0:
+            insert_state.append(l)
+    if group_size > 1:
+        insert_state = [insert_state[i:i+group_size] for i in range(0, len(insert_state), group_size)]
+    return set_state, insert_state
+
+def parseInsertSQL(sql):
+    ts, sensor_id = sql.split(", ")[-2:]
+    res = re.search(r"\s*'(.+)'",ts)
+    ts = res[1]
+    ts = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S').timestamp()
+    
+    res = re.search(r"\s*'(.+)'",sensor_id)
+    sensor_id = res[1]
+    return sensor_id, ts
+
+def packetByTS(sql_list):
+    sql_list = sorted(sql_list)
+    res = []
+    start = sql_list[0][0]
+    tmp = []
+    for ts, sql in sql_list:
+        if ts - start < TIME_INT:
+            tmp.append((ts, sql))
+            continue
+
+        if len(tmp) > 0:
+            res.append(tmp)
+        while ts - start >= TIME_INT:
+            start += TIME_INT
+        tmp = [(ts, sql)]
+    return res
+_, insert_state = parseInsertFile(INSERT_FILE)
+
+s = ServerProxy(args.host, allow_none=True)
+temp = defaultdict(list)
+MIN_T = float("+inf")
+MAX_T = float("-inf")
+for sql in insert_state:
+    sensor, ts = parseInsertSQL(sql)
+    temp[sensor].append((ts, sql))
+    MIN_T = min(MIN_T, ts)
+    MAX_T = max(MAX_T, ts)
+
+origin_scale = (MAX_T - MIN_T) / 60
+target_int = 12 * 60 # 12 min
+scale_coef = origin_scale / 12
+print("From {} minutes to {} minutes ".format(origin_scale, 12))
+for k in temp:
+    temp[k] = packetByTS(temp[k])
+    temp[k].reverse()
+a = list(temp.keys())[0]
+
+s.user_insert(a, temp[a][0])
