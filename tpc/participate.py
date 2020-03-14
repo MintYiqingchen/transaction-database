@@ -5,12 +5,10 @@ import os
 import sys
 import argparse
 import time
-import timeit
-from datetime import datetime, timedelta
 import socket
 import psycopg2 as pg2
 import psycopg2.pool
-import traceback
+import asyncio
 parser = argparse.ArgumentParser()
 parser.add_argument('--host', default="127.0.0.1")
 parser.add_argument('--user', default="postgres")
@@ -20,10 +18,11 @@ parser.add_argument('--port', default="5432")
 parser.add_argument('--rpcport', default=15000, type=int)
 parser.add_argument('--coordinator_uri', default="http://127.0.0.1:25000")
 parser.add_argument('--thread_num', type=int, default=32)
+parser.add_argument('--timeout', type=int, default=30)
 args = parser.parse_args()
 
 class Participate(object):
-    _rpc_methods_ = ['tpc_prepare', 'tpc_commit', 'tpc_abort', 'execute', 'recovery_message']
+    _rpc_methods_ = ['tpc_prepare', 'tpc_commit', 'tpc_abort', 'execute', 'wait_message']
     def __init__(self, address, db_pool):
         self.db_pool = db_pool
         self._ip = address[0]
@@ -34,9 +33,11 @@ class Participate(object):
 
         self._status = {} # txn_id --> ["Init", "Abort", "Prepare"]
         self._locks = {} # txn_id --> threading.Lock
-    
+        self._bigLock = Lock()
+        self._loop = asyncio.get_event_loop()
     def recover_prepared_txn(self):
         conn = self.db_pool.getconn()
+        uri = 'http://'+self._ip + ':'+str(self._port)
         with conn.cursor() as curs:
             curs.execute("select gid from pg_prepared_xacts where user=%s and database=%s;", (args.user,args.database))
             txn_id = curs.fetchone()
@@ -49,7 +50,7 @@ class Participate(object):
             
             with ServerProxy(args.coordinator_uri, allow_none=True) as proxy:
                 for txn_id in key:
-                    res = proxy.recovery_message(txn_id)
+                    res = proxy.recovery_message(txn_id, uri)
                     if res['op'] == 'COMMIT':
                         curs.execute('COMMIT PREPARED %s', (txn_id,))
                         del self._status[txn_id]
@@ -59,7 +60,7 @@ class Participate(object):
                         del self._status[txn_id]
                         del self._locks[txn_id]
         self.db_pool.putconn(conn)
-    def recovery_message(self, txn_id):
+    def wait_message(self, txn_id):
         if txn_id not in self._locks:
             return {'errCode': 0, 'isWait': 0}
         return {'errCode': 0, 'isWait': 1}
@@ -90,8 +91,8 @@ class Participate(object):
                     curs.execute('ROLLBACK PREPARED %s', (txn_id,))
                 self.db_pool.putconn(txn_id)
             del self._status[txn_id]
-        
-        del self._locks[txn_id]
+        with self._bigLock:
+            del self._locks[txn_id]
         return {'errCode': 0}
 
     def tpc_commit(self, txn_id):
@@ -105,14 +106,15 @@ class Participate(object):
                     curs.execute('COMMIT PREPARED %s', (txn_id,))
                 self.db_pool.putconn(txn_id)
             del self._status[txn_id]
-        
-        del self._locks[txn_id]
+        with self._bigLock:
+            del self._locks[txn_id]
         return {'errCode': 0}
 
     def execute(self, txn_id, sql):
         conn = self.db_pool.getconn(txn_id)
         if txn_id not in self._locks:
             self._locks[txn_id] = Lock()
+            self._loop.call_later(args.timeout, serv.change_to_abort, txn_id)
         
         with self._locks[txn_id]:
             if txn_id not in self._status:
@@ -136,6 +138,27 @@ class Participate(object):
         with ServerProxy(args.coordinator_uri, allow_none=True) as proxy:
             uri = 'http://'+self._ip + ':'+str(self._port)
             a = proxy.participate_register(uri)
+    
+    def change_to_abort(self, txn_id):
+        if txn_id not in self._locks:
+            return
+
+        with self._locks[txn_id]:
+            if self._status[txn_id] == "Abort":
+                return
+            conn = self.db_pool.getconn(txn_id)
+            with conn.cursor() as curs:
+                curs.execute('ROLLBACK PREPARED %s', (txn_id,))
+            self.db_pool.putconn(txn_id)
+            del self._status[txn_id]
+        with self._bigLock:
+            del self._locks[txn_id]
+
+    def timeout_loop(self):
+        try:
+            self._loop.run_forever()
+        except Exception:
+            self._loop.close()
 
 if __name__ == '__main__':
     global IP
@@ -158,6 +181,9 @@ if __name__ == '__main__':
         t = Thread(target=serv.serve_forever)
         t.daemon = True
         t.start()
+    t = Thread(target=serv.timeout_loop)
+    t.daemon = True
+    t.start()
     serv.recover_prepared_txn()
     serv.participate_register()
     serv.serve_forever()
