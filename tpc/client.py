@@ -70,9 +70,35 @@ origin_scale = (MAX_T - MIN_T) / 60
 target_int = 12 * 60 # 12 min
 scale_coef = origin_scale / 12
 print("From {} minutes to {} minutes ".format(origin_scale, 12))
-for k in temp:
-    temp[k] = packetByTS(temp[k])
-    temp[k].reverse()
-a = list(temp.keys())[0]
 
-s.user_insert(a, temp[a][0])
+#--------
+
+def suser_insert(sensor_id, txn_package):
+    print('id = {}, txn = {}'.format(str(sensor_id)[0],txn_package[0][0]))
+
+async def send(loop, temp): #k的事务
+    start = MIN_T
+    canstop = False
+    while not canstop:
+        canstop = True
+        for sensor in temp:
+            if len(temp[sensor]) == 0:
+                continue
+            canstop = False
+            startT = temp[sensor][-1][-1][0]
+            waitT = (startT - start)/scale_coef
+            print('wait = ',waitT)
+            txn = temp[sensor][-1]
+            temp[sensor].pop()
+            loop.call_later(waitT + 2, suser_insert, sensor, txn)
+
+    await asyncio.sleep(13*60)
+
+for k in temp:
+    temp[k] = packetByTS(temp[k]) #我把它每 5 分钟合在一起 总是20天 引射到12分
+    temp[k].reverse()
+loop = asyncio.get_event_loop()
+try:
+    loop.run_until_complete(send(loop,temp))
+finally:
+    loop.close()
