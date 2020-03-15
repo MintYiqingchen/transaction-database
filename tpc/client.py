@@ -88,7 +88,7 @@ async def send(loop, temp):
     start = 2
     while not canstop:
         canstop = True
-        for sensor in temp:
+        for i, sensor in enumerate(temp):
             if len(temp[sensor]) == 0:
                 continue
             canstop = False
@@ -98,7 +98,9 @@ async def send(loop, temp):
             txn = temp[sensor][-1]
             temp[sensor].pop()
             loop.call_later(start, suser_insert, loop, sensor, txn)
-            start += 0.45
+            if i % 100 == 0:
+                await asyncio.sleep(1.13)
+        await asyncio.sleep(4)
 
     await asyncio.sleep(13*60)
 

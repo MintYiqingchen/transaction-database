@@ -62,7 +62,7 @@ class Coordinator(object):
 
     def send_to_participate(self, arg_pkg):
         txn_id, sensor_id, sql_ts, sql = arg_pkg
-        participate_id = hash((sensor_id, sql_ts)) % len(self.participate_table)
+        participate_id = hash((sensor_id, sql_ts, sql)) % len(self.participate_uri)
         uri = self.participate_uri[participate_id]
         proxy, lock = self.participate_table[uri]
         with self._data_lock:
@@ -118,6 +118,7 @@ class Coordinator(object):
         with self.pool_lock:
             a = self.thread_pool.map(self.send_to_participate, \
                 [(txn_id, sensor_id, sql_ts, sql) for sql_ts, sql in txn_package], timeout=args.timeout)
+        time.sleep(0.05)
         try:
             [f for f in a] # synchronize
         except Exception as e:
@@ -130,6 +131,7 @@ class Coordinator(object):
             self._data[txn_id]['status'] = 'Prepare'
         with self.pool_lock:
             a = self.thread_pool.map(self.tpc_prepare, [(txn_id, uri) for uri in uris], timeout=args.timeout)
+        time.sleep(0.05)
         try:
             decision = self.handle_vote(a) # True-->commit, False-->abort
         except Exception as e:
@@ -143,6 +145,7 @@ class Coordinator(object):
                 del self._data[txn_id]
             with self.pool_lock:
                 a = self.thread_pool.map(self.tpc_abort,  [(txn_id, uri) for uri in uris], timeout=args.timeout)
+            time.sleep(0.05)
             try:
                 [f for f in a] # synchronize
             except Exception as e:
@@ -152,6 +155,7 @@ class Coordinator(object):
             self.logf.force_write('COMMIT {} {}\n'.format(txn_id, ','.join(uris)))
             with self.pool_lock:
                 a = self.thread_pool.map(self.tpc_commit,  [(txn_id, uri) for uri in uris], timeout=args.timeout)
+            time.sleep(0.05)
             canfinish = False
             try:
                 [f for f in a] # synchronize
@@ -174,6 +178,7 @@ class Coordinator(object):
             return {'errCode': 0}
         self.participate_table[uri] = (ServerProxy(uri, allow_none=True), Lock())
         self.participate_uri.append(uri)
+        print('register: {}'.format(uri))
         return {'errCode': 0}
 
     def serve_forever(self):
@@ -197,6 +202,7 @@ class Coordinator(object):
 
     def periodical_garbage_collection(self):
         while True:
+            
             snapshot = {}
             with self._data_lock:
                 for k, v in self._data.items():
@@ -206,8 +212,10 @@ class Coordinator(object):
             for txn_id, uris in snapshot.items():
                 with self.pool_lock:
                     a = self.thread_pool.map(self.wait_message,  [(txn_id, uri) for uri in uris], timeout=args.timeout)
+                    print('Start garbage collection...')
                 try:
                     a = [res['isWait'] for res in a] # synchronize
+                    print('isWait:', a)
                     for i, res in enumerate(a):
                         if res == 0:
                             with self._data_lock:
@@ -233,6 +241,7 @@ class Coordinator(object):
             elif a[0] == "COMPLETE":
                 del txn_data[a[1]]
         self._data = txn_data
+        print('After coordinator recover, len(self._data)==', len(self._data))
 
     def recovery_message(self, txn_id, uri):
         with self._data_lock:

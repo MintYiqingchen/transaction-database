@@ -48,10 +48,12 @@ class Participate(object):
             self._status[xid.gtrid]['xid'] = xid
             self._status[xid.gtrid]['status'] = 'Prepare'
         key = list(self._status.keys())
+        print('After participate recover, txn_ids', key)
         with ServerProxy(args.coordinator_uri, allow_none=True) as proxy:
             for txn_id in key:
                 try:
                     res = proxy.recovery_message(txn_id, uri)
+                    print('{} ask for txn_id {} op {}'.format(uri, txn_id, res['op']))
                 except ConnectionError as v:
                     print("Connection ERROR ", v)
                     continue
