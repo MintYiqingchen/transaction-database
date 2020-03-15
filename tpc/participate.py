@@ -9,6 +9,8 @@ import socket
 import psycopg2 as pg2
 import psycopg2.pool
 import asyncio
+import traceback
+from collections import defaultdict
 parser = argparse.ArgumentParser()
 parser.add_argument('--host', default="127.0.0.1")
 parser.add_argument('--user', default="postgres")
@@ -21,6 +23,8 @@ parser.add_argument('--thread_num', type=int, default=32)
 parser.add_argument('--timeout', type=int, default=30)
 args = parser.parse_args()
 
+def statusItem():
+    return {'xid':None, 'status':'Init'}
 class Participate(object):
     _rpc_methods_ = ['tpc_prepare', 'tpc_commit', 'tpc_abort', 'execute', 'wait_message']
     def __init__(self, address, db_pool):
@@ -31,7 +35,7 @@ class Participate(object):
         for name in self._rpc_methods_:
             self._serv.register_function(getattr(self, name))
 
-        self._status = {} # txn_id --> ["Init", "Abort", "Prepare"]
+        self._status = {} # defaultdict(statusItem) # txn_id --> ["Init", "Abort", "Prepare"]
         self._locks = {} # txn_id --> threading.Lock
         self._bigLock = Lock()
         self._loop = asyncio.get_event_loop()
@@ -64,7 +68,6 @@ class Participate(object):
         if txn_id not in self._locks:
             return {'errCode': 0, 'isWait': 0}
         return {'errCode': 0, 'isWait': 1}
-
     def tpc_prepare(self, txn_id):
         if txn_id not in self._locks:
             return {'errCode': 0, 'vote': 0}
@@ -76,7 +79,7 @@ class Participate(object):
         
             conn = self.db_pool.getconn(txn_id)
             with conn.cursor() as curs:
-                curs.execute('PREPARE TRANSACTION %s', (txn_id,))
+                curs.execute('PREPARE TRANSACTION %s;', (txn_id,))
             self._status[txn_id] = 'Prepare'
             return {'errCode': 0, 'vote': 1}
 
@@ -89,7 +92,8 @@ class Participate(object):
                 conn = self.db_pool.getconn(txn_id)
                 with conn.cursor() as curs:
                     curs.execute('ROLLBACK PREPARED %s', (txn_id,))
-                self.db_pool.putconn(txn_id)
+                conn.abort()
+                self.db_pool.putconn(conn, key = txn_id)
             del self._status[txn_id]
         with self._bigLock:
             del self._locks[txn_id]
@@ -104,7 +108,8 @@ class Participate(object):
                 conn = self.db_pool.getconn(txn_id)
                 with conn.cursor() as curs:
                     curs.execute('COMMIT PREPARED %s', (txn_id,))
-                self.db_pool.putconn(txn_id)
+                conn.commit()
+                self.db_pool.putconn(conn, key = txn_id)
             del self._status[txn_id]
         with self._bigLock:
             del self._locks[txn_id]
@@ -126,9 +131,11 @@ class Participate(object):
                 with conn.cursor() as curs:
                     curs.execute(sql)
             except pg2.DatabaseError:
+                traceback.print_exc()
                 self._status[txn_id] = "Abort"
                 conn.rollback()
-                self.db_pool.putconn(conn, txn_id)
+                self.db_pool.putconn(conn, key=txn_id)
+            
             return {'errCode': 0}
 
     def serve_forever(self):
@@ -149,7 +156,7 @@ class Participate(object):
             conn = self.db_pool.getconn(txn_id)
             with conn.cursor() as curs:
                 curs.execute('ROLLBACK PREPARED %s', (txn_id,))
-            self.db_pool.putconn(txn_id)
+            self.db_pool.putconn(conn, key=txn_id)
             del self._status[txn_id]
         with self._bigLock:
             del self._locks[txn_id]
@@ -176,14 +183,14 @@ if __name__ == '__main__':
     print(IP)
     
     serv = Participate((IP, args.rpcport), pgpool)
-    
-    for _ in range(1, args.thread_num):
-        t = Thread(target=serv.serve_forever)
-        t.daemon = True
-        t.start()
-    t = Thread(target=serv.timeout_loop)
-    t.daemon = True
-    t.start()
+
+    # for _ in range(1, args.thread_num):
+    #     t = Thread(target=serv.serve_forever)
+    #     t.daemon = True
+    #     t.start()
+    # t = Thread(target=serv.timeout_loop)
+    # t.daemon = True
+    # t.start()
     serv.recover_prepared_txn()
-    serv.participate_register()
-    serv.serve_forever()
+    # serv.participate_register()
+    # serv.serve_forever()

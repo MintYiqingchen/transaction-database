@@ -7,6 +7,7 @@ import timeit
 import re
 from datetime import datetime, timedelta
 from collections import defaultdict
+import asyncio
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--host', default="http://127.0.0.1:25000")
@@ -16,7 +17,7 @@ INSERT_FILE = './data/low_concurrency/observation_low_concurrency.sql'
 TIME_INT = 5 * 60 # 5 min
 def parseInsertFile(fname, group_size = 1):
     with open(fname) as f:
-        states = [line.strip() for line in f if not line.startswith('--')]
+        states = [line.strip() for _, line in zip(range(35000),f) if not line.startswith('--')]
     set_state = []
     insert_state = []
     for l in states:
@@ -75,7 +76,7 @@ print("From {} minutes to {} minutes ".format(origin_scale, 12))
 
 def suser_insert(sensor_id, txn_package):
     print('id = {}, txn = {}'.format(str(sensor_id)[0],txn_package[0][0]))
-
+    
 async def send(loop, temp): #k的事务
     start = MIN_T
     canstop = False
@@ -90,7 +91,7 @@ async def send(loop, temp): #k的事务
             print('wait = ',waitT)
             txn = temp[sensor][-1]
             temp[sensor].pop()
-            loop.call_later(waitT + 2, suser_insert, sensor, txn)
+            loop.call_later(waitT + 2, s.user_insert, sensor, txn)
 
     await asyncio.sleep(13*60)
 

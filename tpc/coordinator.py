@@ -51,7 +51,7 @@ class Coordinator(object):
         self.participate_table = {} # uri -> rpc clients, lock
 
         self._data_lock = Lock()
-        self._data = {} # txn_id --> {'participates': dict, 'status'} ['Init', Prepare, COMMIT]
+        self._data = defaultdict(txnItem) # txn_id --> {'participates': set, 'status'} ['Init', Prepare, COMMIT]
         self._serv = SimpleXMLRPCServer(address, allow_none=True)
         for name in self._rpc_methods_:
             self._serv.register_function(getattr(self, name))
@@ -59,29 +59,40 @@ class Coordinator(object):
         self.thread_pool = ThreadPoolExecutor()
         self.pool_lock = Lock()
 
-    def send_to_participate(self, txn_id, sensor_id, sql_ts, sql):
+    def send_to_participate(self, arg_pkg):
+        txn_id, sensor_id, sql_ts, sql = arg_pkg
         participate_id = hash((sensor_id, sql_ts)) % len(self.participate_table)
         uri = self.participate_uri[participate_id]
         proxy, lock = self.participate_table[uri]
         with self._data_lock:
+            # print(self._data[txn_id])
             self._data[txn_id]['participates'].add(uri)
         with lock:
-            proxy.execute(sql)
+            proxy.execute(txn_id, sql)
+
     def handle_vote(self, future_list):
         votelist = [res['vote'] for res in future_list] # synchronize
         return all(votelist)
-    def tpc_prepare(self, txn_id, uri):
+    def wait_message(self, arg_pkg):
+        txn_id, uri = arg_pkg
+        proxy, lock = self.participate_table[uri]
+        with lock:
+            return proxy.wait_message(txn_id)
+    def tpc_prepare(self, arg_pkg):
+        txn_id, uri = arg_pkg
         proxy, lock = self.participate_table[uri]
         with lock:
             return proxy.tpc_prepare(txn_id)
-    def tpc_commit(self, txn_id, uri):
+    def tpc_commit(self, arg_pkg):
+        txn_id, uri = arg_pkg
         proxy, lock = self.participate_table[uri]
         with lock:
             res = proxy.tpc_commit(txn_id)
         with self._data_lock:
             self._data[txn_id]['participates'].discard(uri)
         return res
-    def tpc_abort(self, txn_id, uri):
+    def tpc_abort(self, arg_pkg):
+        txn_id, uri = arg_pkg
         proxy, lock = self.participate_table[uri]
         with lock:
             return proxy.tpc_abort(txn_id)
@@ -91,14 +102,14 @@ class Coordinator(object):
         # Step 0: get txn_id and set txn database
         txn_id = str(self.counter.increment())
         with self._data_lock:
-            self._data[txn_id] = defaultdict(txnItem)
+            self._data[txn_id] = txnItem()
 
         # Step 1: normal execution
         with self.pool_lock:
             a = self.thread_pool.map(self.send_to_participate, \
                 [(txn_id, sensor_id, sql_ts, sql) for sql_ts, sql in txn_package], timeout=120)
         try:
-            [_ for _ in a] # synchronize
+            [f for f in a] # synchronize
         except concurrent.futures.TimeoutError:
             return {'errCode': 1, 'errString': 'Participate timeout'}
         
@@ -121,7 +132,7 @@ class Coordinator(object):
             with self.pool_lock:
                 a = self.thread_pool.map(self.tpc_abort,  [(txn_id, uri) for uri in uris], timeout=120)
             try:
-                [_ for _ in a] # synchronize
+                [f for f in a] # synchronize
             except concurrent.futures.TimeoutError:
                 pass
             return {'errCode': 1, 'errString': 'Transaction abort'}
@@ -131,7 +142,7 @@ class Coordinator(object):
                 a = self.thread_pool.map(self.tpc_commit,  [(txn_id, uri) for uri in uris], timeout=120)
             canfinish = False
             try:
-                [_ for _ in a] # synchronize
+                [f for f in a] # synchronize
                 with self._data_lock:
                     del self._data[txn_id]
                 canfinish = True
@@ -147,8 +158,8 @@ class Coordinator(object):
     def participate_register(self, uri):
         if uri in self.participate_table:
             return {'errCode': 0}
-        self.participate_table[uri] = ServerProxy(uri, allow_none=True)
-        self.participate_uri.append((uri, Lock()))
+        self.participate_table[uri] = (ServerProxy(uri, allow_none=True), Lock())
+        self.participate_uri.append(uri)
         return {'errCode': 0}
 
     def serve_forever(self):
@@ -175,7 +186,7 @@ class Coordinator(object):
             with self._data_lock:
                 for k, v in self._data.items():
                     if v['status'] == 'Commit':
-                        snapshot[k] = set(v['participates'])
+                        snapshot[k] = list(v['participates'])
                 
             for txn_id, uris in snapshot.items():
                 with self.pool_lock:
@@ -196,8 +207,11 @@ class Coordinator(object):
         for line in self.logf.call('readlines'):
             a = line.strip().split()
             if a[0] == "COMMIT":
-                txn_data[a[1]]['participate'] = set(a[2].split(','))
+                tmp = a[2].split(',')
+                txn_data[a[1]]['participates'] = set(tmp)
                 txn_data[a[1]]['status'] = 'Commit'
+                for uri in tmp:
+                    self.participate_register(uri)
             elif a[0] == "COMPLETE":
                 del txn_data[a[1]]
         self._data = txn_data

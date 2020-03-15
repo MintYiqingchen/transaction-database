@@ -2,3 +2,4 @@ data/
 queries/
 schema/
 .vscode/
+*.log
