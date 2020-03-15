@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timedelta
 from collections import defaultdict
 import asyncio
+import random
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--host', default="http://127.0.0.1:25000")
@@ -74,24 +75,30 @@ print("From {} minutes to {} minutes ".format(origin_scale, 12))
 
 #--------
 
-def suser_insert(sensor_id, txn_package):
-    print('id = {}, txn = {}'.format(str(sensor_id)[0],txn_package[0][0]))
-    
-async def send(loop, temp): #k的事务
-    start = MIN_T
+def suser_insert(loop, sensor_id, txn_package):
+    #print('id = {}, txn = {}'.format(str(sensor_id)[0],txn_package[0][0]))
+    try:
+        s.user_insert(sensor, txn_package)
+    except ConnectionError as v:
+        print("Connection ERROR ", v)
+        loop.call_later(3, suser_insert, loop, sensor_id, txn_package)
+async def send(loop, temp): 
+    # start = MIN_T
     canstop = False
+    start = 2
     while not canstop:
         canstop = True
         for sensor in temp:
             if len(temp[sensor]) == 0:
                 continue
             canstop = False
-            startT = temp[sensor][-1][-1][0]
-            waitT = (startT - start)/scale_coef
-            print('wait = ',waitT)
+            # startT = temp[sensor][-1][-1][0]
+            # waitT = (startT - start)/scale_coef
+            # print('wait = ',waitT)
             txn = temp[sensor][-1]
             temp[sensor].pop()
-            loop.call_later(waitT + 2, s.user_insert, sensor, txn)
+            loop.call_later(start, suser_insert, loop, sensor, txn)
+            start += 0.45
 
     await asyncio.sleep(13*60)
 

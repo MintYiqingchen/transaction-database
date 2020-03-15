@@ -8,11 +8,12 @@ from collections import defaultdict
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-from threading import Thread, Lock
+from threading import Thread, Lock, currentThread
 parser = argparse.ArgumentParser()
 parser.add_argument('--port', default=25000, type=int)
 parser.add_argument('--thread_num', type=int, default=8)
 parser.add_argument('--logfile', default="coor.log")
+parser.add_argument('--timeout', type=int, default=30)
 args = parser.parse_args()
 
 class ThreadSafeCounter(object):
@@ -68,8 +69,13 @@ class Coordinator(object):
             # print(self._data[txn_id])
             self._data[txn_id]['participates'].add(uri)
         with lock:
-            proxy.execute(txn_id, sql)
-
+            while True:
+                try:
+                    return proxy.execute(txn_id, sql)
+                except ConnectionError as v:
+                    print("Connection ERROR ", v)
+                time.sleep(10)
+        
     def handle_vote(self, future_list):
         votelist = [res['vote'] for res in future_list] # synchronize
         return all(votelist)
@@ -77,7 +83,11 @@ class Coordinator(object):
         txn_id, uri = arg_pkg
         proxy, lock = self.participate_table[uri]
         with lock:
-            return proxy.wait_message(txn_id)
+            try:
+                return proxy.wait_message(txn_id)
+            except ConnectionError as v:
+                print("Connection ERROR ", v)
+                return {'errCode': 0, 'isWait': 1}
     def tpc_prepare(self, arg_pkg):
         txn_id, uri = arg_pkg
         proxy, lock = self.participate_table[uri]
@@ -107,10 +117,11 @@ class Coordinator(object):
         # Step 1: normal execution
         with self.pool_lock:
             a = self.thread_pool.map(self.send_to_participate, \
-                [(txn_id, sensor_id, sql_ts, sql) for sql_ts, sql in txn_package], timeout=120)
+                [(txn_id, sensor_id, sql_ts, sql) for sql_ts, sql in txn_package], timeout=args.timeout)
         try:
             [f for f in a] # synchronize
-        except concurrent.futures.TimeoutError:
+        except Exception as e:
+            print('Exeutin Error: ', e)
             return {'errCode': 1, 'errString': 'Participate timeout'}
         
         # Step 1: prepare commit
@@ -118,10 +129,11 @@ class Coordinator(object):
             uris = set(self._data[txn_id]['participates'])
             self._data[txn_id]['status'] = 'Prepare'
         with self.pool_lock:
-            a = self.thread_pool.map(self.tpc_prepare, [(txn_id, uri) for uri in uris], timeout=120)
+            a = self.thread_pool.map(self.tpc_prepare, [(txn_id, uri) for uri in uris], timeout=args.timeout)
         try:
             decision = self.handle_vote(a) # True-->commit, False-->abort
-        except concurrent.futures.TimeoutError:
+        except Exception as e:
+            print('Prepare Error: ', e)
             decision = False
         
         # Step 2: broadcast decision
@@ -130,23 +142,24 @@ class Coordinator(object):
             with self._data_lock:
                 del self._data[txn_id]
             with self.pool_lock:
-                a = self.thread_pool.map(self.tpc_abort,  [(txn_id, uri) for uri in uris], timeout=120)
+                a = self.thread_pool.map(self.tpc_abort,  [(txn_id, uri) for uri in uris], timeout=args.timeout)
             try:
                 [f for f in a] # synchronize
-            except concurrent.futures.TimeoutError:
-                pass
+            except Exception as e:
+                print('Abort Error: ', e)
             return {'errCode': 1, 'errString': 'Transaction abort'}
         else:
             self.logf.force_write('COMMIT {} {}\n'.format(txn_id, ','.join(uris)))
             with self.pool_lock:
-                a = self.thread_pool.map(self.tpc_commit,  [(txn_id, uri) for uri in uris], timeout=120)
+                a = self.thread_pool.map(self.tpc_commit,  [(txn_id, uri) for uri in uris], timeout=args.timeout)
             canfinish = False
             try:
                 [f for f in a] # synchronize
                 with self._data_lock:
                     del self._data[txn_id]
                 canfinish = True
-            except concurrent.futures.TimeoutError:
+            except Exception as e:
+                print('Commit Error: ', e)
                 with self._data_lock:
                     self._data[txn_id]['status'] = 'Commit'
 
@@ -155,6 +168,7 @@ class Coordinator(object):
 
         self.logf.call('write', 'COMPLETE {}\n'.format(txn_id))
         return {'errCode': 0}
+        
     def participate_register(self, uri):
         if uri in self.participate_table:
             return {'errCode': 0}
@@ -171,13 +185,14 @@ class Coordinator(object):
             with self._data_lock:
                 uris = set(self._data[txn_id]['participates'])
             with self.pool_lock:
-                a = self.thread_pool.map(self.tpc_commit,  [(txn_id, uri) for uri in uris], timeout=120)
+                a = self.thread_pool.map(self.tpc_commit,  [(txn_id, uri) for uri in uris], timeout=args.timeout)
             try:
                 [_ for _ in a] # synchronize
                 with self._data_lock:
                     del self._data[txn_id]
                 canfinish = True
-            except concurrent.futures.TimeoutError:
+            except Exception as e:
+                print(' Periodical Commit Error: ', e)
                 time.sleep(5)
 
     def periodical_garbage_collection(self):
@@ -190,16 +205,19 @@ class Coordinator(object):
                 
             for txn_id, uris in snapshot.items():
                 with self.pool_lock:
-                    a = self.thread_pool.map(self.wait_message,  [(txn_id, uri) for uri in uris], timeout=120)
+                    a = self.thread_pool.map(self.wait_message,  [(txn_id, uri) for uri in uris], timeout=args.timeout)
                 try:
                     a = [res['isWait'] for res in a] # synchronize
                     for i, res in enumerate(a):
                         if res == 0:
                             with self._data_lock:
                                 self._data[txn_id]['participates'].discard(uris[i])
+                    if len(self._data[txn_id]['participates']) == 0:
+                        del self._data[txn_id]
+                        self.logf.call('write', 'COMPLETE {}\n'.format(txn_id))
                 except concurrent.futures.TimeoutError:
                     pass
-            time.sleep(120)
+            time.sleep(45)
 
     def recover(self):
         self.logf.call('seek', 0)
