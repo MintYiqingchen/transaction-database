@@ -8,3 +8,6 @@ The simulator is able to create and process multithreaded transactions on multip
 ## two-phase commit protocol
 Distributed transactions using two-phase commit protocol on top of PostgreSQL.
 The distributed system is mimiced by creating multiple PostgreSQL servers and agent instances in Docker containers. There is one coordinator node, which will interact with the client, start the distributed transaction and route the inserts/updates to the corresponding nodes through their respective agents.
+
+## Acknowledgement
+Thank [Zhiyu Tao](https://github.com/zhiyutao) and [Kevin Zhu](https://github.com/KevinXiaoruZhu) for participating !!!
